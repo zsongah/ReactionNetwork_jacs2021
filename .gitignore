@@ -1,0 +1,24 @@
+# Caches
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# FlowER prediction cache (machine-specific; portable but large)
+cache/
+
+# Generated outputs
+results/*.json
+results/*.png
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python build
+*.egg-info/
+build/
+dist/

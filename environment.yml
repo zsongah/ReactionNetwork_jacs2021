@@ -1,0 +1,13 @@
+name: jacs2021
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - networkx>=3.2
+  - numpy>=1.26
+  - matplotlib>=3.8
+  - rdkit>=2024.3
+  - jupyterlab>=4.0
+  - ipykernel
+  - pytest>=7.0
+  - pip
