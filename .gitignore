@@ -11,6 +11,7 @@ cache/
 # Generated outputs
 results/*.json
 results/*.png
+results/*.log
 
 # Editor / OS
 .DS_Store

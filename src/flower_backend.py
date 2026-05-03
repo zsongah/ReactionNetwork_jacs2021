@@ -330,7 +330,14 @@ class FlowERBackend:
         if not path.exists():
             return None
         with path.open() as f:
-            return json.load(f)
+            data = json.load(f)
+        # Back-compat: old cache files stored a bare list of
+        # [product_smiles, count] pairs. New files wrap that list in a
+        # dict together with the reactant SMILES so offline analyses
+        # (coverage, tier-bias calibration) can recover what was asked.
+        if isinstance(data, dict):
+            return data.get("products", [])
+        return data
 
     def _cache_store(
         self, reactant_smiles: str, products: list[tuple[str, int]],
@@ -338,9 +345,18 @@ class FlowERBackend:
         path = self.cfg.cache_dir / f"{self._cache_key(reactant_smiles)}.json"
         # Atomic write: a SIGINT during the write must not leave a
         # half-written file that the next run trusts as a cache hit.
+        # Schema (v2): persist the reactant SMILES alongside the
+        # products so downstream tooling can iterate the cache without
+        # needing to reverse the SHA1 key.
+        payload = {
+            "reactants": reactant_smiles,
+            "model": self.cfg.model_name,
+            "sample_size": self.cfg.sample_size,
+            "products": products,
+        }
         tmp = path.with_suffix(path.suffix + ".tmp")
         with tmp.open("w") as f:
-            json.dump(products, f)
+            json.dump(payload, f)
         os.replace(tmp, path)
 
     # ------------------------------------------------------------------
