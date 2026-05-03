@@ -42,6 +42,7 @@ import pickle
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
@@ -290,18 +291,22 @@ class FlowERBackend:
             # gets its own subprocess (fresh torch import overhead, but
             # that's ~10–15 s vs many minutes saved on partial failures).
             chunk = max(1, int(self.cfg.chunk_size))
+            n_chunks = (len(misses) + chunk - 1) // chunk
+            t_start = time.time()
             for start in range(0, len(misses), chunk):
                 batch = misses[start : start + chunk]
+                idx = start // chunk + 1
+                log.info(
+                    "FlowER chunk %d/%d: %d combos (elapsed %.0f s)",
+                    idx, n_chunks, len(batch), time.time() - t_start,
+                )
                 try:
                     invoked = self._run_subprocess([smi for _, smi in batch])
                 except FlowERUnavailable as e:
                     log.warning(
                         "FlowER chunk %d/%d failed (%d combos): %s. "
                         "Skipping this chunk; cached partial progress kept.",
-                        start // chunk + 1,
-                        (len(misses) + chunk - 1) // chunk,
-                        len(batch),
-                        e,
+                        idx, n_chunks, len(batch), e,
                     )
                     continue
                 for (combo, smi), per_reactant in zip(batch, invoked):
@@ -331,8 +336,12 @@ class FlowERBackend:
         self, reactant_smiles: str, products: list[tuple[str, int]],
     ) -> None:
         path = self.cfg.cache_dir / f"{self._cache_key(reactant_smiles)}.json"
-        with path.open("w") as f:
+        # Atomic write: a SIGINT during the write must not leave a
+        # half-written file that the next run trusts as a cache hit.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w") as f:
             json.dump(products, f)
+        os.replace(tmp, path)
 
     # ------------------------------------------------------------------
     # Result materialization
