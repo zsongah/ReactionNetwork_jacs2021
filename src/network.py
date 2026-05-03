@@ -18,15 +18,47 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from itertools import product as iproduct
+from itertools import combinations, product as iproduct
 from typing import Iterable, Optional
 
 from .bde_model import predict_recomb_dG
 from .fragrec import n_step_fragment, recombine_pool
 from .molecule import MoleculeGraph, dedupe
-from .thermo import MU_E_LI_METAL, Reaction
+from .thermo import MU_E_LI_METAL, CandidateTier, Reaction, classify_tier
 
 log = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# Combo enumeration
+# ----------------------------------------------------------------------
+def enumerate_combos(
+    pool: list[MoleculeGraph],
+    sizes: Iterable[int] = (1, 2),
+) -> list[tuple[MoleculeGraph, ...]]:
+    """All unordered combos of given sizes drawn from ``pool``.
+
+    Size-1 yields singletons (rearrangements). Size-2 yields unordered
+    pairs *with* self-pairs (a + a) — the paper allows "2 R → P" steps.
+    Size-3 yields unordered triples without repetition; if you need
+    radical + 2 substrates with one repeated substrate, that's still
+    covered by FlowER's beam search since FlowER consumes a multiset of
+    reactants.
+    """
+    out: list[tuple[MoleculeGraph, ...]] = []
+    sizes = sorted(set(sizes))
+    if 1 in sizes:
+        out.extend((m,) for m in pool)
+    if 2 in sizes:
+        # all unordered pairs incl. self-pairs
+        for i, a in enumerate(pool):
+            out.append((a, a))
+            for j in range(i + 1, len(pool)):
+                out.append((a, pool[j]))
+    if 3 in sizes:
+        for trio in combinations(pool, 3):
+            out.append(trio)
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -40,45 +72,89 @@ def build_species_pool(
     *,
     backend: str = "fragrec",
     flower_backend=None,
-) -> tuple[list[MoleculeGraph], dict[tuple[tuple[str, ...], tuple[str, ...]], float]]:
-    """Reproduce the 4-stage species generation of Sec 2.1.
+    flower_as_generator: bool = False,
+    max_pool_iterations: int = 1,
+    flower_prob_threshold: float = 0.05,
+    combo_sizes: Iterable[int] = (1, 2),
+) -> tuple[
+    list[MoleculeGraph],
+    dict[tuple[tuple[str, ...], tuple[str, ...]], float],
+]:
+    """Build the species pool.
 
-    1. n-step fragmentation of every seed.
-    2. One-step recombination of every fragment pair.
-    3. ML filter: keep only exergonic recombinations (ΔG_recomb < threshold).
-    4. (Skipped here:) DFT geometry optimization.
+    Two architectural modes:
 
-    Backend dispatch
-    ----------------
-    - ``"fragrec"`` (default): the paper's combinatorial pipeline.
-    - ``"flower"``: queries a configured FlowER backend on every pair of
-      *organic* species in the seed-derived fragment pool. The reactant
-      sets it returns become reactions; the product molecules expand the
-      species pool.
-    - ``"both"``: union of the two. Organic combinations get FlowER; Li /
-      charged / radical-bearing combinations stay with fragrec, matching
-      the user's policy of letting fragrec handle the electrochemistry.
+    *Default* (``flower_as_generator=False``)
+        Backwards-compatible behaviour: fragrec drives fragmentation +
+        recombination; FlowER, if requested, produces priors used only to
+        re-rank existing reactions. Equivalent to the v1 pipeline.
+
+    *FlowER-as-generator* (``flower_as_generator=True``, requires
+    ``backend in {"flower", "both"}``)
+        FlowER outputs become **new species** in the pool. We iterate:
+
+            pool_0 = fragrec fragments of seeds (+ recombinants)
+            for i = 1 .. max_pool_iterations:
+                combos = enumerate_combos(pool_{i-1}, sizes=combo_sizes)
+                flower_products = expand FlowER over flower-routed combos
+                fragrec_products = recombine fragrec-routed combos
+                pool_i = pool_{i-1} ∪ {acceptable flower_products}
+                                    ∪ {acceptable fragrec_products}
+                stop if no new species
+
+        Each FlowER output is filtered through ``is_acceptable_flower_product``
+        before being admitted. Combos containing Li / charged species /
+        free electrons are routed to fragrec automatically by
+        :func:`flower_backend.route_combo`.
+
+    Parameters
+    ----------
+    backend
+        ``"fragrec"`` (default), ``"flower"``, or ``"both"``.
+    flower_as_generator
+        If True, FlowER products feed back into the pool (see above).
+        Has no effect for ``backend == "fragrec"``.
+    max_pool_iterations
+        How many expansion rounds to run when ``flower_as_generator``.
+        Each round re-enumerates combos over the *current* pool.
+    flower_prob_threshold
+        Minimum probability a FlowER prediction must have to enter the
+        pool. Default 0.05 — keep this tight to control hallucinations.
+    combo_sizes
+        Reactant-multiplicity values to enumerate. The FlowER training
+        distribution is dominated by 2-element combos; size 1 and 3 are
+        also useful but produce noisier predictions.
 
     Returns
     -------
     pool
-        Deduplicated list of MoleculeGraph (seeds + fragments + recombinants
-        + any FlowER products).
+        Deduplicated MoleculeGraph list.
     flower_priors
-        ``{(reactant_hashes, product_hashes): probability}``. Empty when
-        backend == "fragrec". Consumed by :func:`enumerate_reactions` to
-        annotate the corresponding ``Reaction`` objects.
+        ``{(sorted_reactant_hashes, sorted_product_hashes): probability}``.
+        Empty when ``backend == "fragrec"``. Consumed by
+        :func:`enumerate_reactions` to annotate ``Reaction`` objects.
     """
     if backend not in ("fragrec", "flower", "both"):
         raise ValueError(f"Unknown backend: {backend!r}")
+    if flower_as_generator and backend == "fragrec":
+        raise ValueError(
+            "flower_as_generator=True requires backend in {'flower','both'}"
+        )
+    if backend in ("flower", "both") and flower_backend is None:
+        raise ValueError(
+            "backend in {'flower','both'} requires flower_backend instance"
+        )
 
-    # 1. Fragmentation pool — used by every backend as input.
+    flower_priors: dict[tuple[tuple[str, ...], tuple[str, ...]], float] = {}
+
+    # ------------------------------------------------------------------
+    # Round 0: classical fragrec fragmentation pool.
+    # ------------------------------------------------------------------
     frags: list[MoleculeGraph] = []
     for s in seeds:
         frags.extend(n_step_fragment(s, n=n_frag_steps))
     frags = dedupe(seeds + frags)
 
-    # 2/3. Recombination via fragrec (skipped if backend == "flower").
     recombs: list[MoleculeGraph] = []
     if backend in ("fragrec", "both"):
         recombs = recombine_pool(frags)
@@ -89,49 +165,124 @@ def build_species_pool(
                     (r.graph.nodes[u]["element"], r.graph.nodes[v]["element"])
                     for u, v in r.graph.edges()
                 ]
-                est_dG = min(
-                    predict_recomb_dG(r, r, r, e) for e in elements
-                ) if elements else 0.0
+                est_dG = (
+                    min(predict_recomb_dG(r, r, r, e) for e in elements)
+                    if elements else 0.0
+                )
                 if est_dG < bde_threshold:
                     kept.append(r)
             recombs = kept
 
-    # 2'. FlowER expansion (organic-only; backend handles filtering).
-    flower_priors: dict[tuple[tuple[str, ...], tuple[str, ...]], float] = {}
-    flower_products: list[MoleculeGraph] = []
-    if backend in ("flower", "both"):
-        if flower_backend is None:
-            raise ValueError(
-                "backend in {'flower','both'} requires flower_backend instance"
-            )
-        # Build candidate reactant tuples: pairs over the fragment pool.
-        # Singletons (rearrangements) are also useful; FlowER handles them.
-        combos: list[tuple[MoleculeGraph, ...]] = [(m,) for m in frags]
-        for i, a in enumerate(frags):
-            for b in frags[i:]:
-                combos.append((a, b))
+    pool = dedupe(frags + recombs)
 
+    # ------------------------------------------------------------------
+    # Static FlowER scoring (legacy, non-generator) path.
+    # ------------------------------------------------------------------
+    if backend in ("flower", "both") and not flower_as_generator:
+        combos = enumerate_combos(pool, sizes=combo_sizes)
         try:
-            preds = flower_backend.expand(combos)
+            preds = flower_backend.expand(combos, min_probability=0.0)
         except Exception as e:
-            log.warning("FlowER expansion failed: %s. Falling back.", e)
+            log.warning("FlowER expansion failed: %s. Continuing without priors.", e)
             preds = []
-
         for pred in preds:
-            for prod in pred.products:
-                flower_products.append(prod)
             r_hashes = tuple(sorted(m.canonical_hash() for m in pred.reactants))
             p_hashes = tuple(sorted(m.canonical_hash() for m in pred.products))
-            # If FlowER predicts the trivial no-op, ignore.
             if r_hashes == p_hashes:
                 continue
-            # Take the max probability if multiple predictions land on the
-            # same (reactants, products) tuple.
             key = (r_hashes, p_hashes)
             flower_priors[key] = max(flower_priors.get(key, 0.0), pred.probability)
+        return pool, flower_priors
 
-    pool = dedupe(frags + recombs + flower_products)
+    # ------------------------------------------------------------------
+    # FlowER-as-generator: iterative pool expansion.
+    # ------------------------------------------------------------------
+    if flower_as_generator:
+        pool = _iterative_flower_expansion(
+            pool=pool,
+            flower_backend=flower_backend,
+            flower_priors=flower_priors,
+            max_pool_iterations=max_pool_iterations,
+            flower_prob_threshold=flower_prob_threshold,
+            combo_sizes=combo_sizes,
+        )
+
     return pool, flower_priors
+
+
+def _iterative_flower_expansion(
+    pool: list[MoleculeGraph],
+    flower_backend,
+    flower_priors: dict[tuple[tuple[str, ...], tuple[str, ...]], float],
+    max_pool_iterations: int,
+    flower_prob_threshold: float,
+    combo_sizes: Iterable[int],
+) -> list[MoleculeGraph]:
+    """Iteratively grow ``pool`` with FlowER products.
+
+    On each round, every flower-routed combo over the current pool is
+    queried; acceptable products extend the pool; rounds stop early when
+    no new species enter.
+    """
+    seen_combo_keys: set[tuple[str, ...]] = set()
+    current_pool = list(pool)
+
+    for it in range(max_pool_iterations):
+        all_combos = enumerate_combos(current_pool, sizes=combo_sizes)
+
+        # Skip combos already queried in earlier rounds.
+        fresh: list[tuple[MoleculeGraph, ...]] = []
+        for combo in all_combos:
+            key = tuple(sorted(m.canonical_hash() for m in combo))
+            if key in seen_combo_keys:
+                continue
+            seen_combo_keys.add(key)
+            fresh.append(combo)
+
+        if not fresh:
+            log.info("FlowER iteration %d: no fresh combos, stopping.", it)
+            break
+
+        try:
+            preds = flower_backend.expand(
+                fresh, min_probability=flower_prob_threshold,
+            )
+        except Exception as e:
+            log.warning("FlowER iteration %d failed: %s. Stopping early.", it, e)
+            break
+
+        # Materialise predictions: record priors and collect new products.
+        before = len(current_pool)
+        existing = {m.canonical_hash() for m in current_pool}
+        new_products: list[MoleculeGraph] = []
+        for pred in preds:
+            r_hashes = tuple(sorted(m.canonical_hash() for m in pred.reactants))
+            p_hashes = tuple(sorted(m.canonical_hash() for m in pred.products))
+            if r_hashes == p_hashes:
+                continue
+            key = (r_hashes, p_hashes)
+            flower_priors[key] = max(
+                flower_priors.get(key, 0.0), pred.probability,
+            )
+            for prod in pred.products:
+                if prod.canonical_hash() not in existing:
+                    new_products.append(prod)
+                    existing.add(prod.canonical_hash())
+
+        if not new_products:
+            log.info(
+                "FlowER iteration %d: no new species (queried %d combos).",
+                it, len(fresh),
+            )
+            break
+
+        current_pool = dedupe(current_pool + new_products)
+        log.info(
+            "FlowER iteration %d: pool %d -> %d (+%d species, %d combos).",
+            it, before, len(current_pool), len(current_pool) - before, len(fresh),
+        )
+
+    return current_pool
 
 
 # ----------------------------------------------------------------------
@@ -195,6 +346,7 @@ def enumerate_reactions(
     flower_priors: Optional[
         dict[tuple[tuple[str, ...], tuple[str, ...]], float]
     ] = None,
+    high_prob_cutoff: float = 0.3,
 ) -> list[Reaction]:
     """Enumerate concerted reactions among ``species``.
 
@@ -206,13 +358,40 @@ def enumerate_reactions(
     If ``flower_priors`` is supplied (a ``{(sorted_reactant_hashes,
     sorted_product_hashes): probability}`` mapping coming from
     :func:`build_species_pool` with a FlowER backend), each enumerated
-    reaction is annotated with its ``p_flower`` and ``source`` fields so
-    that :func:`thermo.reaction_cost` can apply the mechanistic prior.
+    reaction is annotated with its ``p_flower``, ``source``, and ``tier``
+    fields so that :func:`thermo.reaction_cost` can apply the mechanistic
+    prior and tier-aware bias.
+
+    Tier assignment
+    ---------------
+    Each ``Reaction`` is tagged with a :class:`CandidateTier`:
+
+      * ``FLOWER_HIGH`` if FlowER probability >= ``high_prob_cutoff``.
+      * ``FLOWER_FRAGREC`` if FlowER endorses *and* the (reactants,
+        products) is also reachable by fragrec's CD-based enumeration
+        (in this implementation: any combo we enumerate is fragrec-
+        reachable, so FlowER+ enumerated == double endorsement).
+      * ``FRAGREC_ORGANIC`` for organic combos FlowER did not predict.
+      * ``FRAGREC_INORGANIC`` for combos containing Li / charged species
+        / electron-transfer steps.
     """
     out: list[Reaction] = []
     by_hash = {m.canonical_hash(): m for m in species}
     hashes = list(by_hash)
     flower_priors = flower_priors or {}
+
+    # Local import to avoid a top-level cycle if backend imports network.
+    from .flower_backend import _METALS
+
+    def _combo_is_organic(mols: list[MoleculeGraph]) -> bool:
+        """Could FlowER even represent this combo? (See route_combo.)"""
+        if any(m.charge != 0 for m in mols):
+            return False
+        for m in mols:
+            for _, d in m.graph.nodes(data=True):
+                if d["element"] in _METALS:
+                    return False
+        return True
 
     # build all reactant tuples (1 or 2 species)
     reactant_sets = [(h,) for h in hashes] + [
@@ -242,6 +421,13 @@ def enumerate_reactions(
             )
             key = (tuple(sorted(rs)), tuple(sorted(ps)))
             p_flower = flower_priors.get(key)
+            is_organic = _combo_is_organic(rmols + pmols)
+            tier = classify_tier(
+                p_flower=p_flower,
+                in_fragrec=True,   # all enumerated combos are fragrec-reachable
+                is_organic=is_organic,
+                high_prob_cutoff=high_prob_cutoff,
+            )
             source = "flower" if p_flower is not None else "fragrec"
             out.append(
                 Reaction(
@@ -252,6 +438,7 @@ def enumerate_reactions(
                     dG=dG,
                     p_flower=p_flower,
                     source=source,
+                    tier=tier,
                 )
             )
     return out

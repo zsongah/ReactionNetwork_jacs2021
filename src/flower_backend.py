@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -52,6 +53,9 @@ from .smiles_bridge import (
     mol_to_smiles,
     mols_to_dot_smiles,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 class FlowERUnavailable(RuntimeError):
@@ -97,17 +101,30 @@ class FlowERConfig:
 
     @classmethod
     def from_env(cls) -> "FlowERConfig":
-        """Construct from environment variables of the same names
-        (uppercase). Everything missing keeps its default."""
+        """Construct from environment variables.
+
+        Two prefixes are supported, in order:
+          1. ``FLOWER_<NAME>`` — preferred, namespaced.
+          2. ``<NAME>`` — raw uppercase (kept for back-compat with the
+             FlowER upstream ``run_FlowER_*.sh`` convention).
+
+        Anything missing keeps its dataclass default.
+        """
+        def _lookup(name: str) -> Optional[str]:
+            return (
+                os.environ.get(f"FLOWER_{name.upper()}")
+                or os.environ.get(name.upper())
+            )
+
         kwargs: dict = {}
         for f in ("repo_path", "model_path", "cache_dir"):
-            v = os.environ.get(f.upper())
+            v = _lookup(f)
             if v:
                 kwargs[f] = Path(v)
         for f in (
             "model_name", "data_name", "exp_name", "python_executable",
         ):
-            v = os.environ.get(f.upper())
+            v = _lookup(f)
             if v:
                 kwargs[f] = v
         for f, cast in (
@@ -116,7 +133,7 @@ class FlowERConfig:
             ("nbest", int), ("max_depth", int), ("chunk_size", int),
             ("test_batch_size", int), ("timeout_s", int),
         ):
-            v = os.environ.get(f.upper())
+            v = _lookup(f)
             if v:
                 kwargs[f] = cast(v)
         return cls(**kwargs)
@@ -132,6 +149,52 @@ class FlowERPrediction:
     reactants: tuple[MoleculeGraph, ...]
     products: tuple[MoleculeGraph, ...]
     probability: float          # count / sample_size, in [0, 1]
+
+
+def _smiles_rdkit_valid(smi: str) -> bool:
+    """Cheap RDKit round-trip check.
+
+    Returns True only if every '.'-separated fragment parses *and*
+    survives ``Chem.AddHs(sanitize=True)``. We mirror what FlowER's
+    ``beam_predict.reactant_process`` does so we can intercept inputs
+    that would otherwise crash the FlowER subprocess on the first
+    fragment and lose the entire batch (Boost.Python ArgumentError on
+    NoneType, no per-row recovery available without vendor patch).
+    """
+    Chem = _get_rdkit_chem()
+    if Chem is None:
+        return True  # if RDKit absent, trust upstream and don't filter
+    for frag in smi.split("."):
+        if not frag:
+            return False
+        m = Chem.MolFromSmiles(frag)
+        if m is None:
+            return False
+        try:
+            Chem.AddHs(m, explicitOnly=False)
+        except Exception:
+            return False
+    return True
+
+
+_RDKIT_CHEM = None
+_RDKIT_INIT_DONE = False
+
+
+def _get_rdkit_chem():
+    """Lazy-import RDKit once and silence its logger; return Chem or None."""
+    global _RDKIT_CHEM, _RDKIT_INIT_DONE
+    if _RDKIT_INIT_DONE:
+        return _RDKIT_CHEM
+    _RDKIT_INIT_DONE = True
+    try:
+        from rdkit import Chem
+        from rdkit import RDLogger
+        RDLogger.DisableLog("rdApp.*")
+        _RDKIT_CHEM = Chem
+    except Exception:
+        _RDKIT_CHEM = None
+    return _RDKIT_CHEM
 
 
 class FlowERBackend:
@@ -157,25 +220,42 @@ class FlowERBackend:
     def expand(
         self,
         reactant_groups: Iterable[tuple[MoleculeGraph, ...]],
+        *,
+        min_probability: float = 0.0,
     ) -> list[FlowERPrediction]:
         """Run FlowER on each reactant tuple.
 
-        The list is filtered to *organic-only* reactant groups before
-        invocation (see :func:`is_organic_combo`). Skipped groups produce
-        no predictions and the caller is expected to handle them via
-        fragrec.
+        The list is filtered to *FlowER-routable* reactant groups before
+        invocation (see :func:`route_combo`). Skipped groups produce no
+        predictions and the caller is expected to handle them via fragrec.
 
         Cache key is the canonical multiset of reactant SMILES plus the
         model checkpoint name; a hit avoids the subprocess entirely.
+
+        Parameters
+        ----------
+        min_probability
+            If > 0, predictions whose materialised probability falls below
+            this threshold are discarded. The same threshold is used by
+            :func:`is_acceptable_flower_product` if you wire it through.
         """
         # Step 1: render & filter
         rendered: list[tuple[tuple[MoleculeGraph, ...], str]] = []
         for combo in reactant_groups:
-            if not is_organic_combo(combo):
+            if route_combo(combo) != "flower":
                 continue
             try:
                 smi = mols_to_dot_smiles(list(combo))
             except BridgeError:
+                continue
+            # Layer-3 guard: defend against fragrec virtual species
+            # (frag/recomb nodes) whose SMILES strings are syntactically
+            # OK but violate valence rules. FlowER's beam_predict.py calls
+            # AddHs() on the parsed mol and crashes the whole batch on a
+            # single None — we cannot recover from a partial-batch failure
+            # without patching vendor code. Round-trip through RDKit
+            # ourselves; skip combos RDKit itself rejects.
+            if not _smiles_rdkit_valid(smi):
                 continue
             rendered.append((combo, smi))
 
@@ -188,7 +268,7 @@ class FlowERBackend:
         for combo, smi in rendered:
             cached = self._cache_load(smi)
             if cached is not None:
-                results.extend(self._materialize(combo, cached))
+                results.extend(self._materialize(combo, cached, min_probability))
             else:
                 misses.append((combo, smi))
 
@@ -205,10 +285,28 @@ class FlowERBackend:
                     "FlowERConfig explicitly. "
                     f"({len(misses)} reactant set(s) missed cache.)"
                 )
-            invoked = self._run_subprocess([smi for _, smi in misses])
-            for (combo, smi), per_reactant in zip(misses, invoked):
-                self._cache_store(smi, per_reactant)
-                results.extend(self._materialize(combo, per_reactant))
+            # Chunk the misses so a single slow / failing batch does not
+            # forfeit all FlowER work for this expansion round. Each chunk
+            # gets its own subprocess (fresh torch import overhead, but
+            # that's ~10–15 s vs many minutes saved on partial failures).
+            chunk = max(1, int(self.cfg.chunk_size))
+            for start in range(0, len(misses), chunk):
+                batch = misses[start : start + chunk]
+                try:
+                    invoked = self._run_subprocess([smi for _, smi in batch])
+                except FlowERUnavailable as e:
+                    log.warning(
+                        "FlowER chunk %d/%d failed (%d combos): %s. "
+                        "Skipping this chunk; cached partial progress kept.",
+                        start // chunk + 1,
+                        (len(misses) + chunk - 1) // chunk,
+                        len(batch),
+                        e,
+                    )
+                    continue
+                for (combo, smi), per_reactant in zip(batch, invoked):
+                    self._cache_store(smi, per_reactant)
+                    results.extend(self._materialize(combo, per_reactant, min_probability))
 
         return results
 
@@ -243,6 +341,7 @@ class FlowERBackend:
         self,
         reactants: tuple[MoleculeGraph, ...],
         predictions: list[tuple[str, int]],
+        min_probability: float = 0.0,
     ) -> list[FlowERPrediction]:
         out: list[FlowERPrediction] = []
         for prod_smi, count in predictions:
@@ -251,6 +350,14 @@ class FlowERBackend:
             except BridgeError:
                 continue
             p = count / max(self.cfg.sample_size, 1)
+            if min_probability > 0 and p < min_probability:
+                continue
+            # Layer 2: post-output sanity / conservation check.
+            if not is_acceptable_flower_product(
+                prods, reactants, p,
+                min_probability=max(min_probability, 1e-6),
+            ):
+                continue
             out.append(FlowERPrediction(
                 reactants=tuple(reactants),
                 products=prods,
@@ -392,23 +499,236 @@ class FlowERBackend:
 
 
 # ----------------------------------------------------------------------
-# Filtering: what counts as "organic"?
+# Filtering layers
+# ----------------------------------------------------------------------
+# These are the gates that decide *whether* a candidate combination of
+# species should be sent to FlowER. They implement the policy laid out in
+# docs/FLOWER_INTEGRATION.md:
+#
+#   Layer 0 (per-species)   is_flower_compatible
+#       Reject species containing metals, multi-charges, or atoms outside
+#       FlowER's training distribution.
+#
+#   Layer 1 (per-combo)     is_reactive_combo
+#       Reject combos with no plausible reactive site, oversized BE matrix,
+#       or implausible mixtures.
+#
+#   Layer 2 (post-output)   is_acceptable_flower_product
+#       Reject FlowER outputs that violate conservation, contain atoms
+#       outside the input set, or look like hallucinations.
+#
+#   Routing                 route_combo
+#       Decides "flower" vs "fragrec" for a given combo.
+
+_METALS = {"Li", "Na", "K", "Mg", "Ca", "Fe", "Co", "Ni", "Cu", "Zn"}
+_FLOWER_ELEMENTS = {"C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I"}
+
+
+def is_flower_compatible(species: MoleculeGraph) -> bool:
+    """Layer 0: can FlowER's BE-matrix architecture even represent this?
+
+    Hard architectural / training-distribution gates:
+      * No metals (Li OOD, transition metals 100% OOD).
+      * Net charge zero. Charged species (especially radical anions like
+        EC•⁻) are very rare in USPTO+RmechDB+PmechDB.
+      * Heavy-atom count <= 30 (FlowER training tops out around there).
+      * All elements drawn from the FlowER element vocabulary.
+
+    Neutral radicals (spin > 0, charge 0) are *allowed* — RmechDB
+    contributes ~5K such steps to FlowER's training set.
+    """
+    if abs(species.charge) > 0:
+        return False
+    heavy = 0
+    for _, d in species.graph.nodes(data=True):
+        el = d["element"]
+        if el in _METALS:
+            return False
+        if el not in _FLOWER_ELEMENTS:
+            return False
+        if el != "H":
+            heavy += 1
+    if heavy > 30:
+        return False
+    return True
+
+
+def has_reactive_site(species: MoleculeGraph) -> bool:
+    """Cheap heuristic: does this molecule have *anything* that could react?
+
+    Used by ``is_reactive_combo`` to skip pairings of inert saturated
+    closed-shell molecules where FlowER would only hallucinate.
+
+    A species is considered reactive if any of these is true:
+      * it carries an unpaired electron (radical),
+      * it has at least one multi-bond (double / triple, ``order >= 2``),
+      * it contains O, N, S, P, or a halogen (lone-pair donors / acceptors
+        and weak bonds).
+    """
+    if species.spin > 0:
+        return True
+    for _, _, edata in species.graph.edges(data=True):
+        if isinstance(edata, dict) and edata.get("order", 1) >= 2:
+            return True
+    for _, d in species.graph.nodes(data=True):
+        if d["element"] in {"O", "N", "S", "P", "F", "Cl", "Br", "I"}:
+            return True
+    return False
+
+
+def is_reactive_combo(
+    combo: Iterable[MoleculeGraph],
+    *,
+    max_total_heavy_atoms: int = 25,
+    max_size: int = 3,
+) -> bool:
+    """Layer 1: is this combination plausibly reactive?
+
+    Rules:
+      1. Each species must pass ``is_flower_compatible``.
+      2. Combo size must lie in [1, max_size]. FlowER's training data is
+         dominated by 2-element combos with a handful of 3-element ones
+         (radical + two substrates). 4+ is OOD.
+      3. Total heavy atoms <= max_total_heavy_atoms; otherwise the BE
+         matrix is too large for FlowER's typical inference window.
+      4. At least one species must have a reactive site, except for size=1
+         where the molecule itself must have a reactive site (otherwise
+         a saturated closed-shell molecule has nothing to rearrange).
+      5. No more than 2 copies of the same species (3+ identical fragments
+         is essentially never seen in training).
+    """
+    combo_list = list(combo)
+    n = len(combo_list)
+    if n == 0 or n > max_size:
+        return False
+
+    if not all(is_flower_compatible(m) for m in combo_list):
+        return False
+
+    total_heavy = 0
+    for m in combo_list:
+        for _, d in m.graph.nodes(data=True):
+            if d["element"] != "H":
+                total_heavy += 1
+    if total_heavy > max_total_heavy_atoms:
+        return False
+
+    if not any(has_reactive_site(m) for m in combo_list):
+        return False
+
+    # Detect 3+ identical species via canonical hash.
+    seen: dict[str, int] = {}
+    for m in combo_list:
+        h = m.canonical_hash()
+        seen[h] = seen.get(h, 0) + 1
+    if max(seen.values()) >= 3:
+        return False
+
+    return True
+
+
+def route_combo(combo: Iterable[MoleculeGraph]) -> str:
+    """Decide which backend handles this reactant combination.
+
+    Returns
+    -------
+    "flower"
+        Pure-organic, neutral, with at least one reactive site. FlowER
+        will be queried; products feed back into the species pool.
+    "fragrec"
+        Anything containing Li/metal/charge, plus combos rejected by the
+        reactive-combo filter. fragrec's combinatorial enumeration covers
+        these (electrochemistry, Li coordination, radical anions, ...).
+    """
+    combo_list = list(combo)
+    if not combo_list:
+        return "fragrec"
+    # Quick reject: any metal anywhere.
+    for m in combo_list:
+        for _, d in m.graph.nodes(data=True):
+            if d["element"] in _METALS:
+                return "fragrec"
+    # Net-charge check: combos that as a whole carry charge are routed to
+    # fragrec because radical-anion / cation chemistry is FlowER-OOD.
+    if sum(m.charge for m in combo_list) != 0:
+        return "fragrec"
+    if any(m.charge != 0 for m in combo_list):
+        return "fragrec"
+    if not is_reactive_combo(combo_list):
+        return "fragrec"
+    return "flower"
+
+
+def is_acceptable_flower_product(
+    products: Iterable[MoleculeGraph],
+    reactants: Iterable[MoleculeGraph],
+    probability: float,
+    *,
+    min_probability: float = 0.05,
+) -> bool:
+    """Layer 2: should we accept a FlowER prediction into the pool?
+
+    FlowER occasionally hallucinates products that violate basic
+    conservation — typically when its beam search exits early on a
+    low-confidence node. We screen them out before they pollute downstream
+    enumeration.
+
+    Checks:
+      * probability >= min_probability,
+      * no metals introduced (FlowER should not invent Li),
+      * heavy-atom count conservation: |Σ heavy(prod) − Σ heavy(react)| <= 1
+        (allow a tiny slack for cases where an explicit H is dropped),
+      * net charge conservation,
+      * no implausible product growth (Σ heavy(prod) > 2 × Σ heavy(react)).
+    """
+    if probability < min_probability:
+        return False
+    prod_list = list(products)
+    react_list = list(reactants)
+    if not prod_list or not react_list:
+        return False
+
+    def heavy(mols: list[MoleculeGraph]) -> int:
+        return sum(
+            1 for m in mols for _, d in m.graph.nodes(data=True)
+            if d["element"] != "H"
+        )
+
+    # No metals introduced (only check products; reactants were already
+    # vetted by is_flower_compatible).
+    for m in prod_list:
+        for _, d in m.graph.nodes(data=True):
+            if d["element"] in _METALS:
+                return False
+
+    # Net charge conservation.
+    if sum(m.charge for m in prod_list) != sum(m.charge for m in react_list):
+        return False
+
+    h_react = heavy(react_list)
+    h_prod = heavy(prod_list)
+    if h_react == 0:
+        return False
+    if abs(h_prod - h_react) > 1:
+        return False
+    if h_prod > 2 * h_react:
+        return False
+
+    return True
+
+
+# ----------------------------------------------------------------------
+# Backward-compatible alias retained for callers/tests written against
+# the original strict (closed-shell, neutral, metal-free) gate.
 # ----------------------------------------------------------------------
 def is_organic_combo(combo: Iterable[MoleculeGraph]) -> bool:
-    """FlowER training data does not include Li / explicit free electrons.
+    """Strictest legacy gate: neutral, closed-shell, metal-free.
 
-    We restrict it to neutral, closed-shell organic combinations. Net
-    charges are allowed only if they balance (e.g., R-O- + H+) but the
-    safer default in this project is to route any charged combo through
-    fragrec, since the paper's electrochemistry is the bigger weakness
-    of FlowER's training distribution.
+    Equivalent to ``is_reactive_combo`` *plus* ``total_spin == 0``.
+    Kept for backwards compatibility with tests that pre-date the
+    layered filter design.
     """
-    total_charge = 0
-    total_spin = 0
-    for m in combo:
-        total_charge += m.charge
-        total_spin += m.spin
-        for _, d in m.graph.nodes(data=True):
-            if d["element"] in {"Li", "Na", "K", "Mg", "Ca"}:
-                return False
-    return total_charge == 0 and total_spin == 0
+    combo_list = list(combo)
+    if not is_reactive_combo(combo_list):
+        return False
+    return sum(m.spin for m in combo_list) == 0

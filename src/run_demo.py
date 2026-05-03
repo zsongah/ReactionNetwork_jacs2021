@@ -98,6 +98,35 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--n-paths", type=int, default=N_PATHS)
     p.add_argument("--verbose", action="store_true")
+
+    # ---- FlowER-as-generator options (opt-in) --------------------------
+    gen = p.add_argument_group("FlowER-as-generator (opt-in)")
+    gen.add_argument(
+        "--flower-as-generator", action="store_true",
+        help="Use FlowER as a primary product generator (in addition to "
+             "fragrec) and feed its products back into the species pool. "
+             "Requires --backend flower or both.",
+    )
+    gen.add_argument(
+        "--max-pool-iterations", type=int, default=1,
+        help="Number of FlowER expansion rounds when "
+             "--flower-as-generator is on (default 1).",
+    )
+    gen.add_argument(
+        "--flower-prob-threshold", type=float, default=0.05,
+        help="Discard FlowER predictions with probability below this "
+             "threshold (default 0.05).",
+    )
+    gen.add_argument(
+        "--combo-sizes", type=str, default="1,2",
+        help="Comma-separated reactant combo sizes to feed FlowER "
+             "(default '1,2'; size 3 supported but slower).",
+    )
+    gen.add_argument(
+        "--use-tier-bias", action="store_true",
+        help="Add per-tier additive bias to reaction cost "
+             "(FLOWER_HIGH discounted, FRAGREC_ORGANIC penalized).",
+    )
     return p.parse_args()
 
 
@@ -139,14 +168,32 @@ def main() -> None:
 
     flower_backend = maybe_make_flower_backend(args.backend)
 
+    # Validate generator-mode flag.
+    if args.flower_as_generator and args.backend == "fragrec":
+        raise SystemExit(
+            "--flower-as-generator requires --backend flower or both."
+        )
+    combo_sizes = tuple(
+        int(s) for s in args.combo_sizes.split(",") if s.strip()
+    )
+
     # ---- 1. species pool -------------------------------------------------
     seeds = list(SEEDS.values())
     print(f"Seeds:                        {[s.name for s in seeds]}")
     print(f"Backend:                      {args.backend}")
+    if args.flower_as_generator:
+        print(f"FlowER-as-generator:          on "
+              f"(iters={args.max_pool_iterations}, "
+              f"p≥{args.flower_prob_threshold}, "
+              f"combo_sizes={combo_sizes})")
 
     pool, flower_priors = build_species_pool(
         seeds, n_frag_steps=N_FRAG_STEPS, keep_endergonic_recomb=False,
         backend=args.backend, flower_backend=flower_backend,
+        flower_as_generator=args.flower_as_generator,
+        max_pool_iterations=args.max_pool_iterations,
+        flower_prob_threshold=args.flower_prob_threshold,
+        combo_sizes=combo_sizes,
     )
     print(f"  raw pool:                   {len(pool)}")
     if flower_priors:
@@ -193,11 +240,13 @@ def main() -> None:
     pf_graph = build_pathfinding_graph(
         reactions, starting_pool=starting, scale=0.5,
         lam=args.lam, p_floor=args.p_floor,
+        use_tier_bias=args.use_tier_bias,
     )
     target_h = target.canonical_hash()
     print(f"Path graph: {pf_graph.number_of_nodes()} nodes, "
           f"{pf_graph.number_of_edges()} edges")
-    print(f"Cost weights: scale=0.5, lam={args.lam}, p_floor={args.p_floor}")
+    print(f"Cost weights: scale=0.5, lam={args.lam}, p_floor={args.p_floor}, "
+          f"tier_bias={args.use_tier_bias}")
 
     # ---- 5. K-shortest paths --------------------------------------------
     paths = k_shortest_paths(pf_graph, target_h, k=args.n_paths)
@@ -225,6 +274,7 @@ def main() -> None:
                     "bond_changes": r.bond_changes,
                     "p_flower": r.p_flower,
                     "source": r.source,
+                    "tier": r.tier.value if r.tier is not None else None,
                 }
                 for r in p.reactions
             ],

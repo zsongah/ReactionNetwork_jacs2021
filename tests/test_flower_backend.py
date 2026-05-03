@@ -79,11 +79,11 @@ def test_cache_hit_serves_predictions_without_subprocess(tmp_path: Path) -> None
     combo = (ec, water)
     smi = mols_to_dot_smiles(list(combo))
 
-    # Pre-seed the cache with a single fake prediction:
-    # EC + H2O -> H2CO3 + ethylene-glycol fragment ([OH] kept simple here).
-    # We use methanol + formic acid, which is what FlowER would *plausibly*
-    # produce for this combo, just to exercise the materialiser.
-    fake_products = [("CO.OC=O", 25)]  # count out of sample_size=50 → P=0.5
+    # Pre-seed the cache with a single fake prediction.
+    # EC (C3H4O3, 6 heavy) + H2O (1 heavy) = 7 heavy atoms total.
+    # Use ethylene glycol + CO2 (4 + 3 = 7 heavy) so the Layer-2
+    # heavy-atom conservation gate accepts it.
+    fake_products = [("OCCO.O=C=O", 25)]  # count out of sample_size=50 → P=0.5
     backend._cache_store(smi, fake_products)
 
     preds = backend.expand([combo])

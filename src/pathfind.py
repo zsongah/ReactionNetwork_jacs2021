@@ -58,6 +58,7 @@ def build_pathfinding_graph(
     *,
     lam: float = 0.0,
     p_floor: float = 0.01,
+    use_tier_bias: bool = False,
 ) -> nx.DiGraph:
     """Construct the directed graph used by Dijkstra.
 
@@ -68,15 +69,19 @@ def build_pathfinding_graph(
         species --(0)--> reaction (when species used as reactant)
 
     Edge weights come from :func:`thermo.reaction_cost`. With ``lam=0``
-    this is the paper's ``softplus(ΔG)`` exactly; with ``lam>0`` and
-    reactions carrying ``p_flower`` it discounts mechanistically
-    well-supported steps.
+    and ``use_tier_bias=False`` this is the paper's ``softplus(ΔG)``
+    exactly; with ``lam>0`` and reactions carrying ``p_flower`` it
+    discounts mechanistically well-supported steps; with
+    ``use_tier_bias=True`` it adds a per-tier additive offset.
     """
     G = nx.DiGraph()
     for i, rxn in enumerate(reactions):
         rnode = f"R{i}"
         G.add_node(rnode, kind="rxn", dG=rxn.dG, rxn=rxn)
-        cost = reaction_cost(rxn, scale=scale, lam=lam, p_floor=p_floor)
+        cost = reaction_cost(
+            rxn, scale=scale, lam=lam, p_floor=p_floor,
+            use_tier_bias=use_tier_bias,
+        )
         for r in rxn.reactants:
             G.add_node(r, kind="species")
             G.add_edge(r, rnode, weight=0.0)

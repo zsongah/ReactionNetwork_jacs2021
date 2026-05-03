@@ -22,3 +22,7 @@ results/*.png
 *.egg-info/
 build/
 dist/
+
+# Vendored FlowER source (clone yourself per docs/FLOWER_LOCAL_DEPLOY.md;
+# the upstream repo is large and changes independently).
+vendor/
