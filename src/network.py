@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 def enumerate_combos(
     pool: list[MoleculeGraph],
     sizes: Iterable[int] = (1, 2),
+    *,
+    reactive_smiles: Optional[set[str]] = None,
 ) -> list[tuple[MoleculeGraph, ...]]:
     """All unordered combos of given sizes drawn from ``pool``.
 
@@ -44,20 +46,43 @@ def enumerate_combos(
     radical + 2 substrates with one repeated substrate, that's still
     covered by FlowER's beam search since FlowER consumes a multiset of
     reactants.
+
+    ``reactive_smiles``
+        Optional set of canonical SMILES of "reactive" species. When
+        provided, size-2 (and size-3) combos are kept only if at least
+        one reactant's SMILES is in this set. Size-1 is unaffected.
+        This is the principled way to prune O(N^2) FlowER calls down
+        to O(K * N) where K = |reactive_smiles|, when the pool contains
+        many large fragmentation products that won't react with each
+        other in any chemically meaningful way (e.g. two large oligo
+        carbonate fragments).
     """
+    from src.smiles_bridge import mol_to_smiles  # local import: avoid cycle
+
     out: list[tuple[MoleculeGraph, ...]] = []
     sizes = sorted(set(sizes))
+
+    def _is_reactive(m: MoleculeGraph) -> bool:
+        if reactive_smiles is None:
+            return True
+        return mol_to_smiles(m) in reactive_smiles
+
     if 1 in sizes:
         out.extend((m,) for m in pool)
     if 2 in sizes:
         # all unordered pairs incl. self-pairs
         for i, a in enumerate(pool):
-            out.append((a, a))
+            a_react = _is_reactive(a)
+            if a_react:
+                out.append((a, a))
             for j in range(i + 1, len(pool)):
-                out.append((a, pool[j]))
+                b = pool[j]
+                if a_react or _is_reactive(b):
+                    out.append((a, b))
     if 3 in sizes:
         for trio in combinations(pool, 3):
-            out.append(trio)
+            if any(_is_reactive(m) for m in trio):
+                out.append(trio)
     return out
 
 
@@ -76,6 +101,7 @@ def build_species_pool(
     max_pool_iterations: int = 1,
     flower_prob_threshold: float = 0.05,
     combo_sizes: Iterable[int] = (1, 2),
+    reactive_smiles: Optional[set[str]] = None,
 ) -> tuple[
     list[MoleculeGraph],
     dict[tuple[tuple[str, ...], tuple[str, ...]], float],
@@ -179,7 +205,7 @@ def build_species_pool(
     # Static FlowER scoring (legacy, non-generator) path.
     # ------------------------------------------------------------------
     if backend in ("flower", "both") and not flower_as_generator:
-        combos = enumerate_combos(pool, sizes=combo_sizes)
+        combos = enumerate_combos(pool, sizes=combo_sizes, reactive_smiles=reactive_smiles)
         try:
             preds = flower_backend.expand(combos, min_probability=0.0)
         except Exception as e:
@@ -205,6 +231,7 @@ def build_species_pool(
             max_pool_iterations=max_pool_iterations,
             flower_prob_threshold=flower_prob_threshold,
             combo_sizes=combo_sizes,
+            reactive_smiles=reactive_smiles,
         )
 
     return pool, flower_priors
@@ -217,6 +244,7 @@ def _iterative_flower_expansion(
     max_pool_iterations: int,
     flower_prob_threshold: float,
     combo_sizes: Iterable[int],
+    reactive_smiles: Optional[set[str]] = None,
 ) -> list[MoleculeGraph]:
     """Iteratively grow ``pool`` with FlowER products.
 
@@ -228,7 +256,7 @@ def _iterative_flower_expansion(
     current_pool = list(pool)
 
     for it in range(max_pool_iterations):
-        all_combos = enumerate_combos(current_pool, sizes=combo_sizes)
+        all_combos = enumerate_combos(current_pool, sizes=combo_sizes, reactive_smiles=reactive_smiles)
 
         # Skip combos already queried in earlier rounds.
         fresh: list[tuple[MoleculeGraph, ...]] = []

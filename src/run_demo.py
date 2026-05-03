@@ -127,6 +127,16 @@ def parse_args() -> argparse.Namespace:
         help="Add per-tier additive bias to reaction cost "
              "(FLOWER_HIGH discounted, FRAGREC_ORGANIC penalized).",
     )
+    gen.add_argument(
+        "--reactive-smiles", type=str, default=None,
+        help="Comma-separated canonical SMILES of 'reactive' species. "
+             "If set, size-2/3 combos are kept only when at least one "
+             "reactant matches this whitelist. Cuts O(N^2) FlowER calls "
+             "down to O(K*N) when most pool species are large oligomeric "
+             "fragments that won't react with each other in any "
+             "chemically meaningful way. Pass an empty string to disable. "
+             "Example: '[H]O[H],O=C=O,[H]O,[H][O],OC1OC(=O)OC1'",
+    )
     return p.parse_args()
 
 
@@ -181,6 +191,13 @@ def main() -> None:
     seeds = list(SEEDS.values())
     print(f"Seeds:                        {[s.name for s in seeds]}")
     print(f"Backend:                      {args.backend}")
+
+    reactive_smiles: set[str] | None = None
+    if args.reactive_smiles is not None and args.reactive_smiles.strip():
+        reactive_smiles = {s.strip() for s in args.reactive_smiles.split(",") if s.strip()}
+        print(f"Reactive whitelist:           {len(reactive_smiles)} SMILES "
+              f"(size-2/3 combos require at least one match)")
+
     if args.flower_as_generator:
         print(f"FlowER-as-generator:          on "
               f"(iters={args.max_pool_iterations}, "
@@ -194,6 +211,7 @@ def main() -> None:
         max_pool_iterations=args.max_pool_iterations,
         flower_prob_threshold=args.flower_prob_threshold,
         combo_sizes=combo_sizes,
+        reactive_smiles=reactive_smiles,
     )
     print(f"  raw pool:                   {len(pool)}")
     if flower_priors:
